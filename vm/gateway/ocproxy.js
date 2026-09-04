@@ -51,18 +51,47 @@ function authed(req, url) {
 }
 const CORS = { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*', 'Access-Control-Allow-Methods': '*' };
 
-// ---- OpenAI → Anthropic 请求翻译 ----
+// ---- OpenAI → Anthropic 请求翻译（含 function calling 双向转换）----
+function textOf(c) {
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) return c.filter(p => p && (p.type === 'text' || typeof p === 'string')).map(p => typeof p === 'string' ? p : (p.text || '')).join('\n');
+  return '';
+}
 function toAnthropic(o) {
   const model = ALIASES[o.model] || DEF_MODEL;
   const msgs = []; const sys = [];
+  const push = (role, block) => {
+    const last = msgs[msgs.length - 1];
+    if (last && last.role === role) last.content.push(block);
+    else msgs.push({ role: role, content: [block] });
+  };
   for (const m of (o.messages || [])) {
-    let text = '';
-    if (typeof m.content === 'string') text = m.content;
-    else if (Array.isArray(m.content)) text = m.content.filter(p => p.type === 'text').map(p => p.text || '').join('\n');
-    if (m.role === 'system' || m.role === 'developer') { if (text) sys.push(text); continue; }
-    const role = (m.role === 'assistant') ? 'assistant' : 'user';
-    if (msgs.length && msgs[msgs.length - 1].role === role) msgs[msgs.length - 1].content += '\n' + text;
-    else msgs.push({ role: role, content: text });
+    if (m.role === 'system' || m.role === 'developer') { const t = textOf(m.content); if (t) sys.push(t); continue; }
+    if (m.role === 'tool') { // OpenAI 工具结果 → Anthropic user/tool_result（连续 tool 消息自动合并进同一 user turn）
+      const blk = { type: 'tool_result', tool_use_id: m.tool_call_id || m.tool_use_id || '' };
+      const c = m.content;
+      if (typeof c === 'string') blk.content = c;
+      else if (Array.isArray(c)) blk.content = c.filter(p => p && p.type === 'text').map(p => p.text || '').join('\n');
+      else if (c != null && typeof c === 'object') blk.content = JSON.stringify(c);
+      else blk.content = '';
+      push('user', blk);
+      continue;
+    }
+    if (m.role === 'assistant') { // OpenAI tool_calls → Anthropic tool_use blocks
+      const t = textOf(m.content);
+      if (t) push('assistant', { type: 'text', text: t });
+      for (const tc of (m.tool_calls || [])) {
+        if (!tc || !tc.function) continue;
+        let input = {}; try { input = JSON.parse(tc.function.arguments || '{}'); if (input == null || typeof input !== 'object') input = {}; } catch (e) { input = {}; }
+        push('assistant', { type: 'tool_use', id: tc.id || ('call_' + Date.now() + Math.random().toString(36).slice(2, 8)), name: tc.function.name, input: input });
+      }
+      continue;
+    }
+    const t = textOf(m.content);
+    if (t) push('user', { type: 'text', text: t });
+  }
+  for (const m of msgs) { // 全 text 块的消息压回字符串
+    if (m.content.every(b => b.type === 'text')) m.content = m.content.map(b => b.text).join('\n');
   }
   if (!msgs.length) msgs.push({ role: 'user', content: ' ' });
   const b = { model: model, messages: msgs, max_tokens: Math.min(o.max_tokens || 4096, 32000) };
@@ -70,6 +99,22 @@ function toAnthropic(o) {
   if (typeof o.temperature === 'number') b.temperature = o.temperature;
   if (typeof o.top_p === 'number') b.top_p = o.top_p;
   if (o.stop) b.stop_sequences = Array.isArray(o.stop) ? o.stop : [o.stop];
+  // tools：OpenAI function 定义 → Anthropic tool 定义
+  const tools = (o.tools || []).map(t => {
+    if (t && t.type === 'function' && t.function) return { name: t.function.name, description: t.function.description || '', input_schema: t.function.parameters || { type: 'object', properties: {} } };
+    if (t && t.name) return { name: t.name, description: t.description || '', input_schema: t.parameters || t.input_schema || { type: 'object', properties: {} } };
+    return null;
+  }).filter(Boolean);
+  if (tools.length && o.tool_choice !== 'none') {
+    b.tools = tools;
+    const tc = o.tool_choice;
+    // 部分平台代理会忽略 tool_choice 强制(any/tool)，除原生字段外再用 system 指令兜底实现 OpenAI 语义
+    let force = '';
+    if (tc === 'required') { force = '[SYSTEM RULE] tool_choice=required: this response MUST call at least one of the available tools. Do not answer with text only.'; b.tool_choice = { type: 'any' }; }
+    else if (tc && typeof tc === 'object' && tc.type === 'function' && tc.function && tc.function.name) { force = '[SYSTEM RULE] tool_choice is forced: this response MUST call the tool "' + tc.function.name + '". Do not answer with text only.'; b.tool_choice = { type: 'tool', name: tc.function.name }; }
+    else if (tc && typeof tc === 'object' && (tc.type === 'any' || tc.type === 'auto' || tc.type === 'tool')) { b.tool_choice = { type: tc.type, name: tc.name }; }
+    if (force) b.system = (b.system ? b.system + '\n\n' : '') + force;
+  }
   return b;
 }
 function llmHeaders() {
@@ -107,11 +152,16 @@ async function handleChat(req, res, bodyBuf) {
   const model = anth.model;
   if (!stream) {
     const d = await up.json();
-    const text = (d.content || []).filter(b => b.type === 'text').map(b => b.text).join('');
-    const think = (d.content || []).filter(b => b.type === 'thinking').map(b => b.thinking).join('');
-    const fin = d.stop_reason === 'max_tokens' ? 'length' : 'stop';
-    const msg = { role: 'assistant', content: text };
+    const blocks = d.content || [];
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join('');
+    const think = blocks.filter(b => b.type === 'thinking').map(b => b.thinking).join('');
+    const toolCalls = blocks.filter(b => b.type === 'tool_use').map((b, i) => ({  // tool_use → OpenAI tool_calls
+      id: b.id || ('call_' + i), type: 'function', function: { name: b.name, arguments: JSON.stringify(b.input || {}) }
+    }));
+    const fin = d.stop_reason === 'max_tokens' ? 'length' : (d.stop_reason === 'tool_use' ? 'tool_calls' : 'stop');
+    const msg = { role: 'assistant', content: toolCalls.length ? (text === '' ? null : text) : text };
     if (think) msg.reasoning_content = think;   // 思考过程 → DeepSeek 风格字段
+    if (toolCalls.length) msg.tool_calls = toolCalls;
     const out = { id: cid, object: 'chat.completion', created: Math.floor(Date.now() / 1000), model: model,
       choices: [{ index: 0, message: msg, finish_reason: fin }],
       usage: { prompt_tokens: (d.usage && d.usage.input_tokens) || 0, completion_tokens: (d.usage && d.usage.output_tokens) || 0,
@@ -125,6 +175,7 @@ async function handleChat(req, res, bodyBuf) {
     created: Math.floor(Date.now() / 1000), model: model, choices: [{ index: 0, delta: delta, finish_reason: fin || null }] }) + '\n\n');
   chunk({ role: 'assistant', content: '' }, null);
   let buf = '';
+  let fin = 'stop';
   const dec = new TextDecoder();
   for await (const raw of up.body) {
     buf += dec.decode(raw, { stream: true });
@@ -135,11 +186,18 @@ async function handleChat(req, res, bodyBuf) {
       const payload = line.slice(5).trim();
       if (!payload) continue;
       let ev; try { ev = JSON.parse(payload); } catch (e) { continue; }
-      if (ev.type === 'content_block_delta') {
+      if (ev.type === 'content_block_start') {   // tool_use 块开始 → tool_calls 起始增量
+        const cb = ev.content_block || {};
+        if (cb.type === 'tool_use') chunk({ tool_calls: [{ index: ev.index, id: cb.id, type: 'function', function: { name: cb.name, arguments: '' } }] }, null);
+      } else if (ev.type === 'content_block_delta') {
         if (ev.delta && ev.delta.type === 'text_delta' && ev.delta.text) chunk({ content: ev.delta.text }, null);
         else if (ev.delta && ev.delta.type === 'thinking_delta' && ev.delta.thinking) chunk({ reasoning_content: ev.delta.thinking }, null);
+        else if (ev.delta && ev.delta.type === 'input_json_delta' && ev.delta.partial_json) chunk({ tool_calls: [{ index: ev.index, function: { arguments: ev.delta.partial_json } }] }, null);
+      } else if (ev.type === 'message_delta') {  // 记录真实 stop_reason
+        if (ev.delta && ev.delta.stop_reason === 'tool_use') fin = 'tool_calls';
+        else if (ev.delta && ev.delta.stop_reason === 'max_tokens') fin = 'length';
       } else if (ev.type === 'message_stop') {
-        chunk({}, 'stop');
+        chunk({}, fin);
         res.write('data: [DONE]\n\n');
       }
     }
