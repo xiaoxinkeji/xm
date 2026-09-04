@@ -1,0 +1,9 @@
+# 敏感信息（永不提交）
+mcq/password
+mcq/status
+mcq/daemon.log
+mcq/in/
+mcq/out/
+**/.token
+*.log
+node_modules/

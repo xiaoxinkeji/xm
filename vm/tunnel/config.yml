@@ -1,0 +1,8 @@
+# cloudflared 本地配置
+# 仅被 quick tunnel（本地管理模式）读取。
+# 命名隧道（token 启动，远程管理模式）忽略本文件——它的路由必须在
+# Cloudflare Zero Trust 控制台的 Public Hostname 里配置。
+#
+# 重要：不要在这里写 ingress！quick tunnel 的随机域名匹配不上
+# ingress 里的主机名，会落入兜底规则导致所有请求 404。
+protocol: http2

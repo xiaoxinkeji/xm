@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# mcq — mc-daemon 文件队列的命令行封装
+#
+# 用法：
+#   ./mcq status                 查看连接状态
+#   ./mcq run "uptime"           把单条命令投递到 VM 执行并等待结果
+#   ./mcq put my-script.sh       把本地脚本投递到 VM 执行（后台，不等待）
+#   ./mcq cat my-script          查看（或等待）某个 job 的输出
+#
+# 前置：mc-daemon.js 已在本机运行，MCQ_DIR 同 daemon（默认 ./mcq）
+set +e
+QDIR="${MCQ_DIR:-$PWD/mcq}"
+IN="$QDIR/in"; OUT="$QDIR/out"
+mkdir -p "$IN" "$OUT"
+
+cmd="$1"; shift
+case "$cmd" in
+  status)
+    cat "$QDIR/status" 2>/dev/null || echo "daemon 未运行或尚无 status";;
+  run)
+    # 单条命令：写临时脚本排队，轮询等结果
+    [ -z "$1" ] && { echo "用法: mcq run \"命令\""; exit 1; }
+    name="run-$(date +%s%N | tail -c 8)"
+    printf '#!/bin/bash\n%s\n' "$1" > "$IN/$name.sh"
+    echo ">> queued: $name"
+    for i in $(seq 1 120); do
+      [ -f "$OUT/$name.out" ] && { echo "---- result ----"; cat "$OUT/$name.out"; exit 0; }
+      sleep 2
+    done
+    echo "超时（240s）——稍后: cat $OUT/$name.out";;
+  put)
+    [ -f "$1" ] || { echo "文件不存在: $1"; exit 1; }
+    name=$(basename "$1" .sh)
+    cp "$1" "$IN/$name.sh"
+    echo ">> queued: $name （结果: $OUT/$name.out）";;
+  cat)
+    name="$1"
+    for i in $(seq 1 120); do
+      [ -f "$OUT/$name.out" ] && { cat "$OUT/$name.out"; exit 0; }
+      sleep 2
+    done
+    echo "尚无结果: $OUT/$name.out";;
+  *)
+    echo "用法: mcq status | run \"命令\" | put 脚本.sh | cat 任务名";;
+esac
